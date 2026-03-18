@@ -262,6 +262,7 @@ ROOM_HTML = '''<!DOCTYPE html>
             border: 2px solid #2c6b9e;
         }
         .btn-danger { background: #dc3545; }
+        .btn-success { background: #28a745; }
         .btn:hover { transform: scale(1.05); }
         .videos-grid {
             display: grid;
@@ -350,6 +351,13 @@ ROOM_HTML = '''<!DOCTYPE html>
             margin: 10px 0;
             text-align: center;
         }
+        .permission-request {
+            background: #e6f0fa;
+            padding: 20px;
+            border-radius: 15px;
+            margin: 20px 0;
+            text-align: center;
+        }
     </style>
 </head>
 <body>
@@ -360,14 +368,18 @@ ROOM_HTML = '''<!DOCTYPE html>
                 <p id="participant-count">Участников: 1</p>
             </div>
             <div class="controls">
-                <button id="mic-btn" class="btn btn-outline">🎤 Микрофон</button>
-                <button id="cam-btn" class="btn btn-outline">📷 Камера</button>
-                <button id="screen-btn" class="btn btn-outline">🖥️ Экран</button>
+                <button id="mic-btn" class="btn btn-outline" disabled>🎤 Микрофон</button>
+                <button id="cam-btn" class="btn btn-outline" disabled>📷 Камера</button>
+                <button id="screen-btn" class="btn btn-outline" disabled>🖥️ Экран</button>
                 <button id="leave-btn" class="btn btn-danger">Покинуть</button>
             </div>
         </div>
 
         <div id="media-error" class="error-message" style="display: none;"></div>
+        <div id="permission-request" class="permission-request" style="display: none;">
+            <p>Для участия в звонке нужен доступ к камере и микрофону.</p>
+            <button id="request-permission-btn" class="btn btn-success">Разрешить доступ</button>
+        </div>
 
         <div class="videos-grid" id="videos-grid"></div>
 
@@ -384,23 +396,28 @@ ROOM_HTML = '''<!DOCTYPE html>
     <script>
         const roomId = '{{ room_id }}';
         const socket = io();
-        const participants = {};
-        let localStream;
+        const participants = {};  // все участники (sid -> данные)
+        let localStream = null;
         let username = 'User_' + Math.random().toString(36).substr(2, 4);
         let micEnabled = true;
         let camEnabled = true;
         let screenStream = null;
         let screenSharing = false;
 
-        const peerConnections = {};
+        const peerConnections = {};  // pc для каждого удалённого участника
+        const pendingParticipants = []; // участники, которые вошли до получения потока
 
         socket.emit('join', { room_id: roomId, username: username });
 
         socket.on('existing_participants', (data) => {
             data.participants.forEach(p => {
                 participants[p.sid] = p;
-                if (p.sid !== socket.id) {
+                // Если поток уже есть, сразу создаём pc
+                if (localStream) {
                     createPeerConnection(p.sid, true);
+                } else {
+                    // Иначе добавляем в ожидающие
+                    pendingParticipants.push(p.sid);
                 }
             });
             updateParticipantsCount();
@@ -408,7 +425,11 @@ ROOM_HTML = '''<!DOCTYPE html>
 
         socket.on('user_joined', (data) => {
             participants[data.sid] = { sid: data.sid, username: data.username };
-            createPeerConnection(data.sid, true);
+            if (localStream) {
+                createPeerConnection(data.sid, true);
+            } else {
+                pendingParticipants.push(data.sid);
+            }
             updateParticipantsCount();
             addChatMessage({ username: 'System', message: `${data.username} присоединился(лась)` });
         });
@@ -427,7 +448,11 @@ ROOM_HTML = '''<!DOCTYPE html>
         });
 
         socket.on('offer', async (data) => {
-            const pc = createPeerConnection(data.from, false);
+            // Создаём pc для того, кто прислал offer, если его ещё нет
+            if (!peerConnections[data.from]) {
+                createPeerConnection(data.from, false);
+            }
+            const pc = peerConnections[data.from];
             await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
             const answer = await pc.createAnswer();
             await pc.setLocalDescription(answer);
@@ -448,7 +473,10 @@ ROOM_HTML = '''<!DOCTYPE html>
             }
         });
 
+        // Создаёт peerConnection для указанного участника
         function createPeerConnection(targetSid, initiator) {
+            if (peerConnections[targetSid]) return peerConnections[targetSid];
+
             const pc = new RTCPeerConnection({
                 iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
             });
@@ -464,14 +492,14 @@ ROOM_HTML = '''<!DOCTYPE html>
                 displayRemoteVideo(targetSid, remoteStream);
             };
 
-            peerConnections[targetSid] = pc;
-
-            // Если локальный поток уже есть, добавляем треки в этот pc
+            // Если у нас уже есть локальный поток, добавляем его треки
             if (localStream) {
                 localStream.getTracks().forEach(track => {
                     pc.addTrack(track, localStream);
                 });
             }
+
+            peerConnections[targetSid] = pc;
 
             if (initiator) {
                 pc.createOffer()
@@ -484,21 +512,31 @@ ROOM_HTML = '''<!DOCTYPE html>
             return pc;
         }
 
-        async function startLocalStream() {
+        // Запрос доступа к медиа (вызывается по кнопке)
+        async function requestMediaAccess() {
             try {
                 localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
                 displayLocalVideo(localStream);
 
-                // Добавляем треки во все существующие peerConnection
-                Object.values(peerConnections).forEach(pc => {
-                    localStream.getTracks().forEach(track => {
-                        pc.addTrack(track, localStream);
-                    });
+                // Создаём pc для всех ожидающих участников
+                pendingParticipants.forEach(sid => {
+                    if (!peerConnections[sid]) {
+                        createPeerConnection(sid, true);
+                    }
                 });
+                // Очищаем список ожидающих
+                pendingParticipants.length = 0;
+
+                // Активируем кнопки
+                document.getElementById('mic-btn').disabled = false;
+                document.getElementById('cam-btn').disabled = false;
+                document.getElementById('screen-btn').disabled = false;
+                document.getElementById('permission-request').style.display = 'none';
             } catch (err) {
                 console.error('Ошибка доступа к медиа:', err);
                 document.getElementById('media-error').style.display = 'block';
                 document.getElementById('media-error').textContent = 'Не удалось получить доступ к камере/микрофону. Проверьте разрешения.';
+                document.getElementById('permission-request').style.display = 'block';
             }
         }
 
@@ -545,6 +583,7 @@ ROOM_HTML = '''<!DOCTYPE html>
             document.getElementById('participant-count').textContent = `Участников: ${Object.keys(participants).length + 1}`;
         }
 
+        // Чат
         socket.on('chat_history', (data) => {
             data.messages.forEach(msg => addChatMessage(msg));
         });
@@ -594,6 +633,7 @@ ROOM_HTML = '''<!DOCTYPE html>
             }
         }
 
+        // Кнопки управления
         document.getElementById('mic-btn').onclick = () => {
             if (localStream) {
                 const audioTrack = localStream.getAudioTracks()[0];
@@ -648,7 +688,9 @@ ROOM_HTML = '''<!DOCTYPE html>
             window.location.href = '/';
         };
 
-        startLocalStream();
+        // Показываем запрос разрешения
+        document.getElementById('permission-request').style.display = 'block';
+        document.getElementById('request-permission-btn').onclick = requestMediaAccess;
 
         window.onbeforeunload = () => {
             socket.emit('leave', { room_id: roomId });
