@@ -1,6 +1,7 @@
 import os
 import uuid
 import time
+from functools import wraps
 from datetime import datetime
 from flask import Flask, render_template_string, request, redirect, url_for, session, jsonify, make_response
 from flask_socketio import SocketIO, emit, join_room, leave_room
@@ -17,6 +18,7 @@ def generate_room_id():
     return str(uuid.uuid4())[:8]
 
 def login_required_voice(f):
+    @wraps(f)
     def decorated_function(*args, **kwargs):
         session_cookie = request.cookies.get('session')
         if not session_cookie:
