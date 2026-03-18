@@ -1,37 +1,27 @@
 import os
 import uuid
 import time
-from functools import wraps
 from datetime import datetime
-from flask import Flask, render_template_string, request, redirect, url_for, session, jsonify, make_response
+from flask import Flask, render_template_string, request, redirect, url_for, jsonify
 from flask_socketio import SocketIO, emit, join_room, leave_room
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'voice-secret-key')
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-MAIN_SITE_URL = 'https://mateugram.onrender.com'  # замените на реальный домен
-
+# Хранилище комнат (в реальном проекте лучше использовать БД)
 rooms = {}
 
 def generate_room_id():
     return str(uuid.uuid4())[:8]
 
-def login_required_voice(f):
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        session_cookie = request.cookies.get('session')
-        if not session_cookie:
-            return redirect(f'{MAIN_SITE_URL}/login?next={request.url}')
-        return f(*args, **kwargs)
-    return decorated_function
-
+# Главная страница
 @app.route('/')
 def index():
     return render_template_string(INDEX_HTML)
 
+# Создание комнаты (теперь без авторизации)
 @app.route('/create')
-@login_required_voice
 def create_room():
     room_id = generate_room_id()
     rooms[room_id] = {
@@ -41,20 +31,21 @@ def create_room():
     }
     return redirect(url_for('room', room_id=room_id))
 
+# Страница комнаты
 @app.route('/room/<room_id>')
-@login_required_voice
 def room(room_id):
     if room_id not in rooms:
         return redirect(url_for('index'))
     return render_template_string(ROOM_HTML, room_id=room_id)
 
+# API: информация о комнате
 @app.route('/api/room/<room_id>')
 def room_info(room_id):
     if room_id not in rooms:
         return jsonify({'error': 'Room not found'}), 404
     return jsonify({'participants': len(rooms[room_id]['participants'])})
 
-# Socket.IO события
+# -------------------- Socket.IO события --------------------
 @socketio.on('join')
 def handle_join(data):
     room_id = data['room_id']
@@ -65,13 +56,16 @@ def handle_join(data):
         'username': username,
         'joined_at': time.time()
     }
+    # Уведомляем всех о новом участнике
     emit('user_joined', {
         'sid': sid,
         'username': username,
         'participants': list(rooms[room_id]['participants'].values())
     }, room=room_id)
+    # Отправляем новому участнику список уже присутствующих
     participants_list = [{'sid': s, **p} for s, p in rooms[room_id]['participants'].items()]
     emit('existing_participants', {'participants': participants_list}, to=sid)
+    # Отправляем историю сообщений чата
     emit('chat_history', {'messages': rooms[room_id]['messages']}, to=sid)
 
 @socketio.on('leave')
@@ -115,6 +109,29 @@ def handle_chat_message(data):
             rooms[room_id]['messages'] = rooms[room_id]['messages'][-100:]
     emit('new-chat-message', msg_data, room=room_id)
 
+@socketio.on('screen-share')
+def handle_screen_share(data):
+    room_id = data['room_id']
+    target_sid = data.get('target')
+    if target_sid:
+        emit('screen-share-offer', {
+            'offer': data['offer'],
+            'from': request.sid
+        }, room=target_sid)
+    else:
+        # Трансляция всем
+        emit('screen-share-started', {
+            'sid': request.sid
+        }, room=room_id, include_self=False)
+
+@socketio.on('screen-share-answer')
+def handle_screen_share_answer(data):
+    target_sid = data['target']
+    emit('screen-share-answer', {
+        'answer': data['answer'],
+        'from': request.sid
+    }, room=target_sid)
+
 @socketio.on('disconnect')
 def handle_disconnect():
     for room_id, room_data in list(rooms.items()):
@@ -122,11 +139,9 @@ def handle_disconnect():
             username = room_data['participants'][request.sid]['username']
             del room_data['participants'][request.sid]
             emit('user_left', {'sid': request.sid, 'username': username}, room=room_id)
-            if not room_data['participants']:
-                pass
             break
 
-# Шаблоны
+# -------------------- Шаблоны --------------------
 INDEX_HTML = '''<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -204,7 +219,7 @@ INDEX_HTML = '''<!DOCTYPE html>
         
         <div style="margin-top: 30px;">
             <p style="margin-bottom: 10px;">Или введите код комнаты:</p>
-            <form action="/join" method="post" onsubmit="event.preventDefault(); window.location.href='/room/' + document.getElementById('room-id').value;">
+            <form onsubmit="event.preventDefault(); window.location.href='/room/' + document.getElementById('room-id').value;">
                 <input type="text" id="room-id" placeholder="Код комнаты" required>
                 <button type="submit" class="btn btn-outline">Присоединиться</button>
             </form>
