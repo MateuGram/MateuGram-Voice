@@ -9,18 +9,15 @@ app = Flask(__name__)
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'voice-secret-key')
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-# Хранилище комнат (в реальном проекте лучше использовать БД)
 rooms = {}
 
 def generate_room_id():
     return str(uuid.uuid4())[:8]
 
-# Главная страница
 @app.route('/')
 def index():
     return render_template_string(INDEX_HTML)
 
-# Создание комнаты (теперь без авторизации)
 @app.route('/create')
 def create_room():
     room_id = generate_room_id()
@@ -31,21 +28,19 @@ def create_room():
     }
     return redirect(url_for('room', room_id=room_id))
 
-# Страница комнаты
 @app.route('/room/<room_id>')
 def room(room_id):
     if room_id not in rooms:
         return redirect(url_for('index'))
     return render_template_string(ROOM_HTML, room_id=room_id)
 
-# API: информация о комнате
 @app.route('/api/room/<room_id>')
 def room_info(room_id):
     if room_id not in rooms:
         return jsonify({'error': 'Room not found'}), 404
     return jsonify({'participants': len(rooms[room_id]['participants'])})
 
-# -------------------- Socket.IO события --------------------
+# -------------------- Socket.IO --------------------
 @socketio.on('join')
 def handle_join(data):
     room_id = data['room_id']
@@ -56,16 +51,13 @@ def handle_join(data):
         'username': username,
         'joined_at': time.time()
     }
-    # Уведомляем всех о новом участнике
     emit('user_joined', {
         'sid': sid,
         'username': username,
         'participants': list(rooms[room_id]['participants'].values())
     }, room=room_id)
-    # Отправляем новому участнику список уже присутствующих
     participants_list = [{'sid': s, **p} for s, p in rooms[room_id]['participants'].items()]
     emit('existing_participants', {'participants': participants_list}, to=sid)
-    # Отправляем историю сообщений чата
     emit('chat_history', {'messages': rooms[room_id]['messages']}, to=sid)
 
 @socketio.on('leave')
@@ -119,18 +111,12 @@ def handle_screen_share(data):
             'from': request.sid
         }, room=target_sid)
     else:
-        # Трансляция всем
-        emit('screen-share-started', {
-            'sid': request.sid
-        }, room=room_id, include_self=False)
+        emit('screen-share-started', {'sid': request.sid}, room=room_id, include_self=False)
 
 @socketio.on('screen-share-answer')
 def handle_screen_share_answer(data):
     target_sid = data['target']
-    emit('screen-share-answer', {
-        'answer': data['answer'],
-        'from': request.sid
-    }, room=target_sid)
+    emit('screen-share-answer', {'answer': data['answer'], 'from': request.sid}, room=target_sid)
 
 @socketio.on('disconnect')
 def handle_disconnect():
@@ -356,6 +342,14 @@ ROOM_HTML = '''<!DOCTYPE html>
         }
         .back-link { margin-top: 10px; text-align: center; }
         .back-link a { color: white; text-decoration: none; }
+        .error-message {
+            background: #dc3545;
+            color: white;
+            padding: 10px;
+            border-radius: 5px;
+            margin: 10px 0;
+            text-align: center;
+        }
     </style>
 </head>
 <body>
@@ -372,6 +366,8 @@ ROOM_HTML = '''<!DOCTYPE html>
                 <button id="leave-btn" class="btn btn-danger">Покинуть</button>
             </div>
         </div>
+
+        <div id="media-error" class="error-message" style="display: none;"></div>
 
         <div class="videos-grid" id="videos-grid"></div>
 
@@ -395,6 +391,8 @@ ROOM_HTML = '''<!DOCTYPE html>
         let camEnabled = true;
         let screenStream = null;
         let screenSharing = false;
+
+        const peerConnections = {};
 
         socket.emit('join', { room_id: roomId, username: username });
 
@@ -428,8 +426,6 @@ ROOM_HTML = '''<!DOCTYPE html>
             }
         });
 
-        const peerConnections = {};
-
         socket.on('offer', async (data) => {
             const pc = createPeerConnection(data.from, false);
             await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
@@ -452,7 +448,7 @@ ROOM_HTML = '''<!DOCTYPE html>
             }
         });
 
-        async function createPeerConnection(targetSid, initiator) {
+        function createPeerConnection(targetSid, initiator) {
             const pc = new RTCPeerConnection({
                 iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
             });
@@ -468,17 +464,23 @@ ROOM_HTML = '''<!DOCTYPE html>
                 displayRemoteVideo(targetSid, remoteStream);
             };
 
+            peerConnections[targetSid] = pc;
+
+            // Если локальный поток уже есть, добавляем треки в этот pc
             if (localStream) {
-                localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+                localStream.getTracks().forEach(track => {
+                    pc.addTrack(track, localStream);
+                });
             }
 
             if (initiator) {
-                const offer = await pc.createOffer();
-                await pc.setLocalDescription(offer);
-                socket.emit('offer', { target: targetSid, offer: offer });
+                pc.createOffer()
+                    .then(offer => pc.setLocalDescription(offer))
+                    .then(() => {
+                        socket.emit('offer', { target: targetSid, offer: pc.localDescription });
+                    });
             }
 
-            peerConnections[targetSid] = pc;
             return pc;
         }
 
@@ -486,8 +488,17 @@ ROOM_HTML = '''<!DOCTYPE html>
             try {
                 localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
                 displayLocalVideo(localStream);
+
+                // Добавляем треки во все существующие peerConnection
+                Object.values(peerConnections).forEach(pc => {
+                    localStream.getTracks().forEach(track => {
+                        pc.addTrack(track, localStream);
+                    });
+                });
             } catch (err) {
                 console.error('Ошибка доступа к медиа:', err);
+                document.getElementById('media-error').style.display = 'block';
+                document.getElementById('media-error').textContent = 'Не удалось получить доступ к камере/микрофону. Проверьте разрешения.';
             }
         }
 
