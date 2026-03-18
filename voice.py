@@ -2,7 +2,7 @@ import os
 import uuid
 import json
 import time
-from flask import Flask, render_template, request, redirect, url_for, session, jsonify
+from flask import Flask, render_template_string, request, redirect, url_for, session, jsonify
 from flask_socketio import SocketIO, emit, join_room, leave_room
 from datetime import datetime
 
@@ -20,7 +20,7 @@ def generate_room_id():
 # Главная страница
 @app.route('/')
 def index():
-    return render_template('index.html')
+    return render_template_string(INDEX_HTML)
 
 # Создание комнаты
 @app.route('/create')
@@ -39,7 +39,7 @@ def create_room():
 def room(room_id):
     if room_id not in rooms:
         return redirect(url_for('index'))
-    return render_template('room.html', room_id=room_id)
+    return render_template_string(ROOM_HTML, room_id=room_id)
 
 # API: информация о комнате
 @app.route('/api/room/<room_id>')
@@ -180,15 +180,7 @@ def handle_disconnect():
                 pass
             break
 
-# Шаблоны HTML (встроены для простоты)
-@app.route('/templates/index.html')
-def serve_index():
-    return render_template_string(INDEX_HTML)
-
-@app.route('/templates/room.html')
-def serve_room():
-    return render_template_string(ROOM_HTML)
-
+# Шаблоны HTML (встроены)
 INDEX_HTML = '''
 <!DOCTYPE html>
 <html lang="ru">
@@ -585,7 +577,7 @@ ROOM_HTML = '''
         }
 
         // Чат
-        socket.on('chat-history', (data) => {
+        socket.on('chat_history', (data) => {
             data.messages.forEach(msg => addChatMessage(msg));
         });
 
