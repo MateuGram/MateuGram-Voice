@@ -1,32 +1,37 @@
 import os
 import uuid
-import json
 import time
-from flask import Flask, render_template_string, request, redirect, url_for, session, jsonify
-from flask_socketio import SocketIO, emit, join_room, leave_room
 from datetime import datetime
+from flask import Flask, render_template_string, request, redirect, url_for, session, jsonify, make_response
+from flask_socketio import SocketIO, emit, join_room, leave_room
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'voice-secret-key')
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-# Хранилище комнат (в реальном проекте лучше использовать БД)
+MAIN_SITE_URL = 'https://mateugram.onrender.com'  # замените на реальный домен
+
 rooms = {}
 
-# Вспомогательные функции
 def generate_room_id():
     return str(uuid.uuid4())[:8]
 
-# Главная страница
+def login_required_voice(f):
+    def decorated_function(*args, **kwargs):
+        session_cookie = request.cookies.get('session')
+        if not session_cookie:
+            return redirect(f'{MAIN_SITE_URL}/login?next={request.url}')
+        return f(*args, **kwargs)
+    return decorated_function
+
 @app.route('/')
 def index():
     return render_template_string(INDEX_HTML)
 
-# Создание комнаты
 @app.route('/create')
+@login_required_voice
 def create_room():
     room_id = generate_room_id()
-    # Сохраняем информацию о комнате
     rooms[room_id] = {
         'created_at': datetime.now(),
         'participants': {},
@@ -34,160 +39,99 @@ def create_room():
     }
     return redirect(url_for('room', room_id=room_id))
 
-# Страница комнаты
 @app.route('/room/<room_id>')
+@login_required_voice
 def room(room_id):
     if room_id not in rooms:
         return redirect(url_for('index'))
     return render_template_string(ROOM_HTML, room_id=room_id)
 
-# API: информация о комнате
 @app.route('/api/room/<room_id>')
 def room_info(room_id):
     if room_id not in rooms:
         return jsonify({'error': 'Room not found'}), 404
-    return jsonify({
-        'participants': len(rooms[room_id]['participants'])
-    })
+    return jsonify({'participants': len(rooms[room_id]['participants'])})
 
 # Socket.IO события
 @socketio.on('join')
 def handle_join(data):
     room_id = data['room_id']
     username = data.get('username', f'User_{uuid.uuid4().hex[:4]}')
-    
     join_room(room_id)
-    
-    # Сохраняем участника
     sid = request.sid
     rooms[room_id]['participants'][sid] = {
         'username': username,
         'joined_at': time.time()
     }
-    
-    # Уведомляем всех в комнате о новом участнике
     emit('user_joined', {
         'sid': sid,
         'username': username,
         'participants': list(rooms[room_id]['participants'].values())
     }, room=room_id)
-    
-    # Отправляем новому участнику список уже присутствующих
     participants_list = [{'sid': s, **p} for s, p in rooms[room_id]['participants'].items()]
     emit('existing_participants', {'participants': participants_list}, to=sid)
-    
-    # Отправляем историю сообщений чата
     emit('chat_history', {'messages': rooms[room_id]['messages']}, to=sid)
 
 @socketio.on('leave')
 def handle_leave(data):
     room_id = data['room_id']
     sid = request.sid
-    
     leave_room(room_id)
-    
     if room_id in rooms and sid in rooms[room_id]['participants']:
         username = rooms[room_id]['participants'][sid]['username']
         del rooms[room_id]['participants'][sid]
-        
-        # Уведомляем остальных
-        emit('user_left', {
-            'sid': sid,
-            'username': username
-        }, room=room_id)
+        emit('user_left', {'sid': sid, 'username': username}, room=room_id)
 
 @socketio.on('offer')
 def handle_offer(data):
     target_sid = data['target']
-    emit('offer', {
-        'offer': data['offer'],
-        'from': request.sid
-    }, room=target_sid)
+    emit('offer', {'offer': data['offer'], 'from': request.sid}, room=target_sid)
 
 @socketio.on('answer')
 def handle_answer(data):
     target_sid = data['target']
-    emit('answer', {
-        'answer': data['answer'],
-        'from': request.sid
-    }, room=target_sid)
+    emit('answer', {'answer': data['answer'], 'from': request.sid}, room=target_sid)
 
 @socketio.on('ice-candidate')
 def handle_ice(data):
     target_sid = data['target']
-    emit('ice-candidate', {
-        'candidate': data['candidate'],
-        'from': request.sid
-    }, room=target_sid)
+    emit('ice-candidate', {'candidate': data['candidate'], 'from': request.sid}, room=target_sid)
 
 @socketio.on('chat-message')
 def handle_chat_message(data):
     room_id = data['room_id']
     username = data['username']
     message = data['message']
-    
     msg_data = {
         'username': username,
         'message': message,
         'time': datetime.now().strftime('%H:%M')
     }
-    
     if room_id in rooms:
         rooms[room_id]['messages'].append(msg_data)
-        # Ограничим историю последними 100 сообщениями
         if len(rooms[room_id]['messages']) > 100:
             rooms[room_id]['messages'] = rooms[room_id]['messages'][-100:]
-    
     emit('new-chat-message', msg_data, room=room_id)
-
-@socketio.on('screen-share')
-def handle_screen_share(data):
-    room_id = data['room_id']
-    target_sid = data.get('target')
-    if target_sid:
-        emit('screen-share-offer', {
-            'offer': data['offer'],
-            'from': request.sid
-        }, room=target_sid)
-    else:
-        # Трансляция всем
-        emit('screen-share-started', {
-            'sid': request.sid
-        }, room=room_id, include_self=False)
-
-@socketio.on('screen-share-answer')
-def handle_screen_share_answer(data):
-    target_sid = data['target']
-    emit('screen-share-answer', {
-        'answer': data['answer'],
-        'from': request.sid
-    }, room=target_sid)
 
 @socketio.on('disconnect')
 def handle_disconnect():
-    # Удаляем участника из всех комнат
     for room_id, room_data in list(rooms.items()):
         if request.sid in room_data['participants']:
             username = room_data['participants'][request.sid]['username']
             del room_data['participants'][request.sid]
-            emit('user_left', {
-                'sid': request.sid,
-                'username': username
-            }, room=room_id)
-            # Если комната пуста, можно удалить её через некоторое время
+            emit('user_left', {'sid': request.sid, 'username': username}, room=room_id)
             if not room_data['participants']:
-                # Можно запланировать удаление, но пока оставим
                 pass
             break
 
-# Шаблоны HTML (встроены)
-INDEX_HTML = '''
-<!DOCTYPE html>
+# Шаблоны
+INDEX_HTML = '''<!DOCTYPE html>
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>MateuGram Voice</title>
+    <link rel="icon" type="image/png" href="https://mateugram.onrender.com/photos/logo.png">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Segoe UI', system-ui, sans-serif; }
         body {
@@ -245,6 +189,8 @@ INDEX_HTML = '''
             outline: none;
         }
         input:focus { border-color: #2c6b9e; }
+        .link { margin-top: 20px; }
+        .link a { color: #2c6b9e; text-decoration: none; }
     </style>
 </head>
 <body>
@@ -261,19 +207,20 @@ INDEX_HTML = '''
                 <button type="submit" class="btn btn-outline">Присоединиться</button>
             </form>
         </div>
+        <div class="link"><a href="https://mateugram.onrender.com">← Вернуться в MateuGram</a></div>
     </div>
 </body>
 </html>
 '''
 
-ROOM_HTML = '''
-<!DOCTYPE html>
+ROOM_HTML = '''<!DOCTYPE html>
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Комната {{ room_id }} | MateuGram Voice</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    <link rel="icon" type="image/png" href="https://mateugram.onrender.com/photos/logo.png">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Segoe UI', system-ui, sans-serif; }
         body {
@@ -281,10 +228,7 @@ ROOM_HTML = '''
             min-height: 100vh;
             padding: 20px;
         }
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-        }
+        .container { max-width: 1200px; margin: 0 auto; }
         .header {
             background: white;
             border-radius: 20px;
@@ -393,6 +337,8 @@ ROOM_HTML = '''
             border-radius: 30px;
             cursor: pointer;
         }
+        .back-link { margin-top: 10px; text-align: center; }
+        .back-link a { color: white; text-decoration: none; }
     </style>
 </head>
 <body>
@@ -419,6 +365,7 @@ ROOM_HTML = '''
                 <button id="send-chat">➤</button>
             </div>
         </div>
+        <div class="back-link"><a href="https://mateugram.onrender.com">← Вернуться в MateuGram</a></div>
     </div>
 
     <script>
@@ -432,10 +379,8 @@ ROOM_HTML = '''
         let screenStream = null;
         let screenSharing = false;
 
-        // Подключение
         socket.emit('join', { room_id: roomId, username: username });
 
-        // Получаем список существующих участников
         socket.on('existing_participants', (data) => {
             data.participants.forEach(p => {
                 participants[p.sid] = p;
@@ -446,7 +391,6 @@ ROOM_HTML = '''
             updateParticipantsCount();
         });
 
-        // Новый участник
         socket.on('user_joined', (data) => {
             participants[data.sid] = { sid: data.sid, username: data.username };
             createPeerConnection(data.sid, true);
@@ -454,7 +398,6 @@ ROOM_HTML = '''
             addChatMessage({ username: 'System', message: `${data.username} присоединился(лась)` });
         });
 
-        // Участник покинул
         socket.on('user_left', (data) => {
             if (participants[data.sid]) {
                 delete participants[data.sid];
@@ -468,7 +411,6 @@ ROOM_HTML = '''
             }
         });
 
-        // WebRTC сигнализация
         const peerConnections = {};
 
         socket.on('offer', async (data) => {
@@ -523,7 +465,6 @@ ROOM_HTML = '''
             return pc;
         }
 
-        // Получение медиа
         async function startLocalStream() {
             try {
                 localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
@@ -576,7 +517,6 @@ ROOM_HTML = '''
             document.getElementById('participant-count').textContent = `Участников: ${Object.keys(participants).length + 1}`;
         }
 
-        // Чат
         socket.on('chat_history', (data) => {
             data.messages.forEach(msg => addChatMessage(msg));
         });
@@ -626,13 +566,12 @@ ROOM_HTML = '''
             }
         }
 
-        // Управление медиа
         document.getElementById('mic-btn').onclick = () => {
             if (localStream) {
                 const audioTrack = localStream.getAudioTracks()[0];
                 if (audioTrack) {
                     audioTrack.enabled = !audioTrack.enabled;
-                    micBtn.textContent = audioTrack.enabled ? '🎤 Микрофон' : '🔇 Микрофон';
+                    document.getElementById('mic-btn').textContent = audioTrack.enabled ? '🎤 Микрофон' : '🔇 Микрофон';
                 }
             }
         };
@@ -642,7 +581,7 @@ ROOM_HTML = '''
                 const videoTrack = localStream.getVideoTracks()[0];
                 if (videoTrack) {
                     videoTrack.enabled = !videoTrack.enabled;
-                    camBtn.textContent = videoTrack.enabled ? '📷 Камера' : '🚫 Камера';
+                    document.getElementById('cam-btn').textContent = videoTrack.enabled ? '📷 Камера' : '🚫 Камера';
                 }
             }
         };
@@ -651,14 +590,11 @@ ROOM_HTML = '''
 
         async function shareScreen() {
             if (screenSharing) {
-                // Остановить демонстрацию
                 screenStream.getTracks().forEach(t => t.stop());
                 screenSharing = false;
-                // Вернуть видео с камеры
                 const newStream = await navigator.mediaDevices.getUserMedia({ video: true });
                 const videoTrack = newStream.getVideoTracks()[0];
                 localStream.addTrack(videoTrack);
-                // Обновить все peerConnection
                 Object.values(peerConnections).forEach(pc => {
                     const sender = pc.getSenders().find(s => s.track.kind === 'video');
                     if (sender) sender.replaceTrack(videoTrack);
@@ -667,7 +603,6 @@ ROOM_HTML = '''
                 try {
                     screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
                     screenSharing = true;
-                    // Заменить видеодорожку
                     const videoTrack = screenStream.getVideoTracks()[0];
                     localStream.addTrack(videoTrack);
                     Object.values(peerConnections).forEach(pc => {
@@ -680,16 +615,13 @@ ROOM_HTML = '''
             }
         }
 
-        // Выход
         document.getElementById('leave-btn').onclick = () => {
             socket.emit('leave', { room_id: roomId });
             window.location.href = '/';
         };
 
-        // Инициализация
         startLocalStream();
 
-        // Обработка отключения
         window.onbeforeunload = () => {
             socket.emit('leave', { room_id: roomId });
         };
