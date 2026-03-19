@@ -125,6 +125,9 @@ def handle_disconnect():
             username = room_data['participants'][request.sid]['username']
             del room_data['participants'][request.sid]
             emit('user_left', {'sid': request.sid, 'username': username}, room=room_id)
+            # Если комната пуста, удаляем её
+            if not room_data['participants']:
+                del rooms[room_id]
             break
 
 # -------------------- Шаблоны --------------------
@@ -396,7 +399,7 @@ ROOM_HTML = '''<!DOCTYPE html>
     <script>
         const roomId = '{{ room_id }}';
         const socket = io();
-        const participants = {};  // все участники (sid -> данные)
+        const participants = {};
         let localStream = null;
         let username = 'User_' + Math.random().toString(36).substr(2, 4);
         let micEnabled = true;
@@ -404,19 +407,17 @@ ROOM_HTML = '''<!DOCTYPE html>
         let screenStream = null;
         let screenSharing = false;
 
-        const peerConnections = {};  // pc для каждого удалённого участника
-        const pendingParticipants = []; // участники, которые вошли до получения потока
+        const peerConnections = {};
+        const pendingParticipants = [];
 
         socket.emit('join', { room_id: roomId, username: username });
 
         socket.on('existing_participants', (data) => {
             data.participants.forEach(p => {
                 participants[p.sid] = p;
-                // Если поток уже есть, сразу создаём pc
                 if (localStream) {
                     createPeerConnection(p.sid, true);
                 } else {
-                    // Иначе добавляем в ожидающие
                     pendingParticipants.push(p.sid);
                 }
             });
@@ -448,7 +449,9 @@ ROOM_HTML = '''<!DOCTYPE html>
         });
 
         socket.on('offer', async (data) => {
-            // Создаём pc для того, кто прислал offer, если его ещё нет
+            // Если у нас ещё нет локального потока, игнорируем offer (позже сами отправим offer)
+            if (!localStream) return;
+
             if (!peerConnections[data.from]) {
                 createPeerConnection(data.from, false);
             }
@@ -473,7 +476,6 @@ ROOM_HTML = '''<!DOCTYPE html>
             }
         });
 
-        // Создаёт peerConnection для указанного участника
         function createPeerConnection(targetSid, initiator) {
             if (peerConnections[targetSid]) return peerConnections[targetSid];
 
@@ -492,7 +494,7 @@ ROOM_HTML = '''<!DOCTYPE html>
                 displayRemoteVideo(targetSid, remoteStream);
             };
 
-            // Если у нас уже есть локальный поток, добавляем его треки
+            // Добавляем все текущие треки из localStream (если есть)
             if (localStream) {
                 localStream.getTracks().forEach(track => {
                     pc.addTrack(track, localStream);
@@ -512,22 +514,17 @@ ROOM_HTML = '''<!DOCTYPE html>
             return pc;
         }
 
-        // Запрос доступа к медиа (вызывается по кнопке)
         async function requestMediaAccess() {
             try {
                 localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
                 displayLocalVideo(localStream);
 
-                // Создаём pc для всех ожидающих участников
+                // Создаём peer connection для всех ожидающих участников
                 pendingParticipants.forEach(sid => {
-                    if (!peerConnections[sid]) {
-                        createPeerConnection(sid, true);
-                    }
+                    createPeerConnection(sid, true);
                 });
-                // Очищаем список ожидающих
                 pendingParticipants.length = 0;
 
-                // Активируем кнопки
                 document.getElementById('mic-btn').disabled = false;
                 document.getElementById('cam-btn').disabled = false;
                 document.getElementById('screen-btn').disabled = false;
@@ -583,7 +580,6 @@ ROOM_HTML = '''<!DOCTYPE html>
             document.getElementById('participant-count').textContent = `Участников: ${Object.keys(participants).length + 1}`;
         }
 
-        // Чат
         socket.on('chat_history', (data) => {
             data.messages.forEach(msg => addChatMessage(msg));
         });
@@ -633,7 +629,6 @@ ROOM_HTML = '''<!DOCTYPE html>
             }
         }
 
-        // Кнопки управления
         document.getElementById('mic-btn').onclick = () => {
             if (localStream) {
                 const audioTrack = localStream.getAudioTracks()[0];
@@ -660,8 +655,7 @@ ROOM_HTML = '''<!DOCTYPE html>
             if (screenSharing) {
                 screenStream.getTracks().forEach(t => t.stop());
                 screenSharing = false;
-                const newStream = await navigator.mediaDevices.getUserMedia({ video: true });
-                const videoTrack = newStream.getVideoTracks()[0];
+                const videoTrack = (await navigator.mediaDevices.getUserMedia({ video: true })).getVideoTracks()[0];
                 localStream.addTrack(videoTrack);
                 Object.values(peerConnections).forEach(pc => {
                     const sender = pc.getSenders().find(s => s.track.kind === 'video');
